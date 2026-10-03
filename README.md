@@ -67,8 +67,8 @@ translators in and pure projections out.
 notif is part of [Hyprforge](https://github.com/hyprforge-suite/hyprforge),
 a suite of native Hyprland desktop applications, where it lives as
 `crates/hyprforge-notif`; this repository,
-[hyprforge-notif](https://github.com/hyprforge-suite/hyprforge-notif), is a
-split of that directory and `sync.sh` keeps it in step. It takes two of the
+[hyprforge-notif](https://github.com/hyprforge-suite/hyprforge-notif), is where
+its code lives, and the monorepo references it as a submodule. It takes two of the
 suite's libraries, `hyprforge-look` and `hyprforge-paths`, from crates.io,
 so it builds on its own. Nothing else in the suite is required: with no
 Hyprforge theme published on the machine, it draws in the theme's defaults.
