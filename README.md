@@ -129,6 +129,14 @@ systemctl --user enable --now notifd.service
 owns `org.freedesktop.Notifications` on the session bus — disable/mask it
 first.
 
+The Arch package enables `notifd.service` for every user when it is
+installed, through a systemd preset. If dunst, mako or swaync is
+installed, it does not: only one of them can run, and a package cannot
+ask which one you want. With Hyprforge Settings installed, its **Set up**
+page (or `hyprforge-settings --setup`) names the other daemon before it
+replaces it, binds `notifctl center` and `notifctl dnd`, and can undo
+all of it, which re-enables the daemon it replaced.
+
 ### Hyprland integration
 
 Add to your Hyprland config so blur/rounding are handled compositor-side and
