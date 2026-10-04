@@ -15,7 +15,8 @@ font shaping (emoji/CJK/RTL all work out of the box).
 - Full `org.freedesktop.Notifications` D-Bus server — urgency levels, actions,
   body markup, images/icons, `replaces_id`, transient/resident notifications.
 - Popup toasts rendered directly onto Wayland layer-shell surfaces (no
-  compositor-side blur — set `layerrule = blur, notif` in Hyprland instead).
+  compositor-side blur — ask Hyprland for it with a layer rule instead; see
+  [Hyprland integration](#hyprland-integration)).
 - Fractional scaling done correctly (crisp at 1.25x, 1.5x, etc.).
 - Notification history ring, kept from the first notification.
 - Do Not Disturb mode — normal notifications are silently filed to history;
@@ -139,14 +140,21 @@ all of it, which re-enables the daemon it replaced.
 
 ### Hyprland integration
 
-Add to your Hyprland config so blur/rounding are handled compositor-side and
-the panel doesn't grab focus:
+Blur behind the toasts and the centre panel is the compositor's job. With
+Hyprforge Settings installed, `hyprforge-settings --setup` (or its Set up
+page) adds it for you. By hand, in a Lua `hyprland.lua` — Hyprland 0.55
+and later read Lua, and the older hyprlang `layerrule = blur, notif`
+lines are not valid there:
 
+```lua
+hl.layer_rule({ name = "notif-blur", match = { namespace = "^notif$" }, blur = true })
+hl.layer_rule({ name = "notif-center-blur", match = { namespace = "^notif-center$" }, blur = true })
 ```
-layerrule = blur, notif
-layerrule = blur, notif-center
-layerrule = ignorezero, notif
-```
+
+The namespaces are anchored because an unanchored `notif` also matches
+`notif-center`. Hyprland rejects a layer-rule field it does not know, and
+a rejected rule fails the whole file it is in, so add only what you have
+checked against your Hyprland version.
 
 ## `notifctl`
 
