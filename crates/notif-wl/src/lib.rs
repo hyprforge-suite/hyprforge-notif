@@ -16,8 +16,14 @@
 //! security risk; `Top` is universally supported and semantically correct.
 //!
 //! # Namespaces
-//! - Toasts: `"notif"` — stable, targeted by Hyprland `layerrule = blur, notif`.
-//! - Center panel: `"notif-center"` — stable, targeted by `layerrule = blur, notif-center`.
+//! - Toasts: `"notif"` — stable, targeted by a Hyprland layer rule:
+//!   `hl.layer_rule({ name = "notif-blur", match = { namespace = "^notif$" }, blur = true })`.
+//! - Center panel: `"notif-center"` — stable, targeted the same way with
+//!   `namespace = "^notif-center$"`.
+//!
+//! Hyprforge's Setup writes exactly these two rules (`hyprforge-setup`'s
+//! notif-blur item), so renaming a namespace breaks blur for every user
+//! who ran it.
 //!
 //! # Event loop (no calloop)
 //! We own the [`EventQueue`] and drive it manually:
