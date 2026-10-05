@@ -1051,26 +1051,34 @@ impl SkiaRenderer {
         // ── Background ────────────────────────────────────────────────────────
         let bg = resolved.background;
         // Premultiply panel background (fully opaque).
-        let bg_pre = [bg.b, bg.g, bg.r, 0xff];
+        //
+        // RGBA, like everything else written into the pixmap: these go
+        // through `fill_rect_premul` straight into tiny-skia's bytes, and
+        // `blit_rgba_to_bgra` reorders them once on the way out. They were
+        // written B-G-R, a second swizzle, so the panel drew the theme's
+        // blue-grey surface as brown while the toasts beside it (painted
+        // through `Color`, which cannot get the order wrong) were right.
+        // `the_center_panel_draws_the_theme_surface` fails if they flip.
+        let bg_pre = [bg.r, bg.g, bg.b, 0xff];
         // Slightly lighter header background.
         let hdr_bg = [
-            bg.b.saturating_add(0x10),
-            bg.g.saturating_add(0x10),
             bg.r.saturating_add(0x10),
+            bg.g.saturating_add(0x10),
+            bg.b.saturating_add(0x10),
             0xff,
         ];
         // Slightly lighter row background for active (live) entries.
         let active_row_bg = [
-            bg.b.saturating_add(0x08),
-            bg.g.saturating_add(0x08),
             bg.r.saturating_add(0x08),
+            bg.g.saturating_add(0x08),
+            bg.b.saturating_add(0x08),
             0xff,
         ];
         // Separator color: slightly lighter than bg.
         let sep_rgba = [
-            bg.b.saturating_add(0x28),
-            bg.g.saturating_add(0x28),
             bg.r.saturating_add(0x28),
+            bg.g.saturating_add(0x28),
+            bg.b.saturating_add(0x28),
             0xff,
         ];
 
@@ -1119,9 +1127,9 @@ impl SkiaRenderer {
         let clear_all_hovered = hover.is_some_and(|t| *t == HitTarget::ClearAll);
         if clear_all_hovered {
             let hl = [
-                bg.b.saturating_add(0x30),
-                bg.g.saturating_add(0x30),
                 bg.r.saturating_add(0x30),
+                bg.g.saturating_add(0x30),
+                bg.b.saturating_add(0x30),
                 0xff,
             ];
             Self::fill_rect_premul(pixmap, &cached.header.clear_all_rect, hl);

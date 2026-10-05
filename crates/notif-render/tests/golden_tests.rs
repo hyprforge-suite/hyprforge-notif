@@ -386,6 +386,46 @@ fn skia_render_bgra_format() {
     );
 }
 
+/// The same claim as `skia_render_bgra_format`, for the center panel —
+/// which fills its background by writing bytes straight into the pixmap
+/// instead of painting through tiny-skia's `Color`, so it can get the
+/// channel order wrong on its own. It did: the fills were written B-G-R
+/// and then swizzled again on the way out, and the panel Super+N opens
+/// drew the theme's blue-grey surface as brown beside correctly coloured
+/// toasts. Nothing tested the panel's pixels, so nothing noticed.
+#[test]
+fn the_center_panel_draws_the_theme_surface() {
+    let mut r = test_renderer();
+    let cfg = Config::default();
+    let expected: Rgba = Theme::default().surface.into();
+    // Make sure the theme's surface is a colour that would show a swap.
+    assert_ne!(
+        expected.r, expected.b,
+        "the check needs r != b to mean anything"
+    );
+
+    let content = notif_render::CenterContent {
+        active: &[],
+        history: &[],
+    };
+    let layout = r.measure_center(&content, &cfg, 1.0);
+    let stride = layout.width * 4;
+    let mut buf = vec![0u8; (stride * layout.height) as usize];
+    r.render_center(&mut buf, stride, &layout, &content, &cfg, 1.0, None);
+
+    // Bottom-left of the panel, inside the border and the corner's curve
+    // and clear of the header and the empty-history placeholder text.
+    let x = 24usize;
+    let y = layout.height as usize - 6;
+    let idx = y * stride as usize + x * 4;
+    let px = &buf[idx..idx + 4];
+    assert_eq!(
+        px,
+        [expected.b, expected.g, expected.r, 0xff],
+        "the panel background must be the theme surface, in BGRA byte order"
+    );
+}
+
 #[test]
 fn skia_render_hi_dpi() {
     let mut r = test_renderer();
