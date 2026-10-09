@@ -10,6 +10,8 @@ Zero-bloat by design: no UI frameworks, no tokio/calloop — just
 for rendering, and [cosmic-text](https://github.com/pop-os/cosmic-text) for
 font shaping (emoji/CJK/RTL all work out of the box).
 
+![Notification toasts, one of them a critical battery warning, beside the notification center with live and earlier notifications](https://raw.githubusercontent.com/hyprforge-suite/hyprforge/main/docs/images/notifications.png)
+
 ## Features
 
 - Full `org.freedesktop.Notifications` D-Bus server — urgency levels, actions,
