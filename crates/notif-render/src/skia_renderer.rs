@@ -1334,6 +1334,12 @@ impl SkiaRenderer {
             }
         }
 
+        // Everything above fills whole rectangles — the panel, the header,
+        // each row — so the corners outside the border's rounding were left
+        // opaque: a square of panel behind each rounded corner. Cut the
+        // panel to its rounded shape before the border goes on.
+        Self::clip_to_rounded(pixmap, bw, bh, resolved.corner_radius as f32 * s);
+
         // Border stroked last so it isn't erased by the full-width header/row
         // background fills drawn above.
         if resolved.border_width > 0 {
@@ -1527,6 +1533,29 @@ impl SkiaRenderer {
     }
 
     /// Build a rounded-rect path.
+    /// Make everything outside a `w`x`h` rounded rectangle at the origin
+    /// transparent, with anti-aliased edges. A degenerate shape or a
+    /// mask that cannot be allocated leaves the pixmap as it was: square
+    /// corners are a cosmetic flaw, a missing panel is not.
+    fn clip_to_rounded(pixmap: &mut Pixmap, w: f32, h: f32, radius: f32) {
+        if radius <= 0.0 {
+            return;
+        }
+        let Some(path) = Self::rounded_rect_path(0.0, 0.0, w, h, radius) else {
+            return;
+        };
+        let Some(mut mask) = tiny_skia::Mask::new(pixmap.width(), pixmap.height()) else {
+            return;
+        };
+        mask.fill_path(
+            &path,
+            tiny_skia::FillRule::Winding,
+            true,
+            tiny_skia::Transform::identity(),
+        );
+        pixmap.apply_mask(&mask);
+    }
+
     fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia::Path> {
         let r = radius.min(w / 2.0).min(h / 2.0);
         if r <= 0.0 {

@@ -426,6 +426,34 @@ fn the_center_panel_draws_the_theme_surface() {
     );
 }
 
+/// The panel is rounded, and nothing may be drawn outside its rounding.
+/// It used to fill whole rectangles and only *stroke* a rounded border, so
+/// a square of opaque panel sat behind each corner — visible as a dark
+/// notch over the wallpaper at the corners of the Super+N panel.
+#[test]
+fn nothing_is_drawn_outside_the_center_panels_rounded_corners() {
+    let mut r = test_renderer();
+    let cfg = Config::default();
+    let content = notif_render::CenterContent {
+        active: &[],
+        history: &[],
+    };
+    let layout = r.measure_center(&content, &cfg, 1.0);
+    let stride = layout.width * 4;
+    let mut buf = vec![0u8; (stride * layout.height) as usize];
+    r.render_center(&mut buf, stride, &layout, &content, &cfg, 1.0, None);
+    let alpha = |x: u32, y: u32| buf[(y * stride + x * 4 + 3) as usize];
+    let (w, h) = (layout.width, layout.height);
+    for (x, y) in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)] {
+        assert_eq!(alpha(x, y), 0, "corner pixel ({x}, {y}) is painted");
+    }
+    assert_eq!(
+        alpha(w / 2, h / 2),
+        0xff,
+        "the middle of the panel must stay opaque"
+    );
+}
+
 #[test]
 fn skia_render_hi_dpi() {
     let mut r = test_renderer();
