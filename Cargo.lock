@@ -771,7 +771,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hyprforge-look"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "hyprforge-paths",
  "serde",
@@ -781,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "hyprforge-paths"
-version = "0.1.11"
+version = "0.1.12"
 
 [[package]]
 name = "image"
@@ -1010,7 +1010,7 @@ dependencies = [
 
 [[package]]
 name = "notif-config"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "async-channel",
  "async-io",
@@ -1028,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "notif-core"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "async-channel",
  "async-executor",
@@ -1043,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "notif-dbus"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "async-channel",
  "async-io",
@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "notif-ipc"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "async-channel",
  "async-executor",
@@ -1073,7 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "notif-render"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "cosmic-text",
  "freedesktop-icons",
@@ -1088,7 +1088,7 @@ dependencies = [
 
 [[package]]
 name = "notif-types"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "async-channel",
  "hyprforge-look",
@@ -1098,7 +1098,7 @@ dependencies = [
 
 [[package]]
 name = "notif-wl"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "async-channel",
  "async-executor",
@@ -1119,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "notifctl"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "notif-ipc",
@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "notifd"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "async-channel",
