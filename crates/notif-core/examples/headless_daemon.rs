@@ -68,7 +68,7 @@ fn main() {
                         active,
                         history,
                     } => {
-                        // Phase 2: center panel rendering not yet implemented here.
+                        // The real panel is notif-wl's; headless, just say what it would show.
                         println!(
                             "SET_CENTER(visible={visible}, active={}, history={})",
                             active.len(),

@@ -40,10 +40,10 @@ notif/
 │   ├── notif-core/         # state manager: the hub
 │   ├── notif-render/       # Renderer trait + tiny-skia/cosmic-text impl
 │   ├── notif-wl/           # everything Wayland (SCTK, layer-shell, input, shm pools)
-│   └── notif-ipc/          # Phase-2 control socket (stub crate; IpcCmd enum defined now)
+│   └── notif-ipc/          # Phase-2 control socket (built; see Task 6)
 └── bin/
     ├── notifd/             # wiring + executor only (~150 lines)
-    └── notifctl/           # Phase 2
+    └── notifctl/           # Phase 2 (built; see Task 7)
 ```
 
 ### Module contracts
