@@ -18,7 +18,7 @@ checking after any dependency change that
 `(cd notif && cargo tree -e features | grep 'zbus feature')` still says
 `async-io` and never `tokio`.
 
-`../../check.sh` has a tier-1 step that runs this workspace's clippy,
+`../../tools/hf check` has a tier-1 step that runs this workspace's clippy,
 fmt and tests separately, because `cargo test --workspace` up there
 cannot reach them and would not say so.
 
