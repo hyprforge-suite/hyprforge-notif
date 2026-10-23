@@ -45,6 +45,7 @@ impl NotifInterface {
     #[allow(clippy::too_many_arguments)]
     async fn notify(
         &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
         app_name: String,
         replaces_id: u32,
         app_icon: String,
@@ -68,6 +69,7 @@ impl NotifInterface {
         let cmd = DbusCmd::Notify {
             n: Box::new(n),
             replaces_id,
+            sender: header.sender().map(|s| s.to_string()),
             reply: reply_tx,
         };
 
@@ -84,10 +86,15 @@ impl NotifInterface {
         Ok(id)
     }
 
-    async fn close_notification(&self, id: u32) -> fdo::Result<()> {
+    async fn close_notification(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        id: u32,
+    ) -> fdo::Result<()> {
         let (reply_tx, reply_rx) = async_channel::bounded::<()>(1);
         let cmd = DbusCmd::Close {
             id,
+            sender: header.sender().map(|s| s.to_string()),
             reply: reply_tx,
         };
 

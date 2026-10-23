@@ -52,7 +52,7 @@ notif/
 - `Notification { id, app_name, app_icon, summary, body, actions: Vec<Action>, urgency, expire_timeout: Timeout{Default|Never|Millis(u32)}, image: Option<ImageSource{Data(RawImage)|Path|Icon}>, transient, resident, category, desktop_entry, created_at, raw_hints: HashMap<String, OwnedValue> }`
 - `RawImage { width, height, rowstride, has_alpha, bits_per_sample, channels, data }` (spec `(iiibiiay)`)
 - `CloseReason { Expired=1, Dismissed=2, CloseCall=3, Undefined=4 }`
-- Channel enums: `DbusCmd { Notify{n, replaces_id, reply: oneshot<u32>}, Close{id, reply} }`; `DbusSignal { NotificationClosed{id, reason}, ActionInvoked{id, action_key}, ActivationToken{...} }`; `UiCommand { Sync(Arc<[DisplayNotification]>), ConfigChanged(Arc<Config>), Shutdown }`; `UiEvent { DismissRequested(u32), ActionInvoked{id, key}, HoverChanged{id, hovered}, OutputsChanged }`; `ConfigEvent(Arc<Config>)`.
+- Channel enums: `DbusCmd { Notify{n, replaces_id, sender, reply: oneshot<u32>}, Close{id, sender, reply} }` (`sender` is the caller's unique bus name); `DbusSignal { NotificationClosed{id, reason}, ActionInvoked{id, action_key}, ActivationToken{...} }`; `UiCommand { Sync(Arc<[DisplayNotification]>), ConfigChanged(Arc<Config>), Shutdown }`; `UiEvent { DismissRequested(u32), ActionInvoked{id, key}, HoverChanged{id, hovered}, OutputsChanged }`; `ConfigEvent(Arc<Config>)`.
 
 **`notif-config`** — `Config::load(path)`, defaults, validation; `watch(path, tx)` inotify task watching the config *directory* (editors rename-swap); invalid reloads are logged and never sent. Surface: anchor corner, margins/gap, max width/height, max visible, per-urgency style (colors, border, radius, default timeout, ignore_timeout), font, icon size, output selection, body-markup toggle. Must not apply config to anything.
 
@@ -115,6 +115,7 @@ Order: vocabulary first, then the two headless-testable modules, then Wayland sh
 ## Known Risks & Gotchas (bake into task prompts)
 
 - **replaces_id**: return the same id; reset expiry; update in place (no re-stack jump); never emit NotificationClosed for replaced content.
+- **Ownership**: only the sender of a notification may replace or close it. A `replaces_id` owned by another sender is treated as unknown (→ new notification); a `CloseNotification` from another sender is a silent no-op, as for an unknown id. IPC (`notifctl`) is the user and is not restricted.
 - **image-data**: rowstride may exceed width×channels — copy row by row; data is RGB(A), needs swizzle to BGRA-in-memory ARGB8888; precedence `image-data` > `image-path` > `app_icon` > `icon_data`, honoring underscore variants from old libnotify.
 - **expire_timeout**: `-1` = server default, `0` = never — don't invert. Emit `ActionInvoked` *before* `NotificationClosed(2)` for the same click.
 - **Layer-surface configure dance**: must ack_configure and commit a buffer of exactly the configured size before mapping; `set_size(w,h)` explicitly since toast size is content-driven.

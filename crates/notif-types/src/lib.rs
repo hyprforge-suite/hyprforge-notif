@@ -346,6 +346,9 @@ pub enum DbusCmd {
         n: Box<NewNotification>,
         /// If non-zero, the ID of an existing notification to replace.
         replaces_id: u32,
+        /// The caller's unique bus name, when the bus said. Only the sender
+        /// of a notification may replace or close it.
+        sender: Option<String>,
         /// Channel to send the assigned ID back on.
         reply: ReplyTx<u32>,
     },
@@ -353,6 +356,8 @@ pub enum DbusCmd {
     Close {
         /// The notification ID to close.
         id: u32,
+        /// The caller's unique bus name, when the bus said.
+        sender: Option<String>,
         /// Channel to signal completion on.
         reply: ReplyTx<()>,
     },

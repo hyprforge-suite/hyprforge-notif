@@ -6,7 +6,7 @@
 //! mutable state (active notifications, waiting queue, history) and mediates
 //! between the D-Bus layer, the UI layer, the config watcher, and the IPC layer.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -95,6 +95,9 @@ pub struct Core<C: Clock> {
     /// removed, cleared).  The async run loop reads and resets this flag to
     /// decide whether to push a `UiCommand::SetCenter` update.
     center_dirty: bool,
+    /// The unique bus name that sent each active or waiting notification,
+    /// so only it may replace or close it.
+    owners: HashMap<u32, String>,
 }
 
 impl<C: Clock> Core<C> {
@@ -110,6 +113,7 @@ impl<C: Clock> Core<C> {
             dnd: false,
             center_visible: false,
             center_dirty: false,
+            owners: HashMap::new(),
         }
     }
 
@@ -188,6 +192,31 @@ impl<C: Clock> Core<C> {
         replaces_id: u32,
         now: Instant,
     ) -> (u32, Vec<DbusSignal>, UiCommand) {
+        self.handle_notify_from(None, n, replaces_id, now)
+    }
+
+    /// [`handle_notify`](Self::handle_notify) for a call from `sender`, the
+    /// caller's unique bus name.
+    ///
+    /// Ids are small sequential integers, so any client could guess
+    /// another's; a `replaces_id` naming a notification some other sender
+    /// owns is treated as no replace at all, and the call becomes a new
+    /// notification. That is what the spec says to do with a
+    /// `replaces_id` that does not exist, and from this sender's side it
+    /// does not.
+    pub fn handle_notify_from(
+        &mut self,
+        sender: Option<&str>,
+        n: Box<NewNotification>,
+        replaces_id: u32,
+        now: Instant,
+    ) -> (u32, Vec<DbusSignal>, UiCommand) {
+        let replaces_id = if replaces_id != 0 && !self.may_touch(sender, replaces_id) {
+            log::debug!("notif-core: replace of {replaces_id} from a sender that does not own it");
+            0
+        } else {
+            replaces_id
+        };
         // Replace in active if replaces_id is found there.
         if replaces_id != 0 {
             if let Some(pos) = self.active.iter().position(|a| a.n.id == replaces_id) {
@@ -223,6 +252,7 @@ impl<C: Clock> Core<C> {
         // Assign an ID to the incoming notification.
         let notification = self.assign_id(n);
         let id = notification.id;
+        self.record_owner(id, sender);
 
         // DND: non-Critical new notifications go straight to history without display.
         if self.dnd && notification.urgency != Urgency::Critical {
@@ -286,6 +316,18 @@ impl<C: Clock> Core<C> {
 
     /// Process a `CloseNotification` D-Bus call.  Returns any signals to emit.
     pub fn handle_close(&mut self, id: u32) -> Vec<DbusSignal> {
+        self.handle_close_from(None, id)
+    }
+
+    /// [`handle_close`](Self::handle_close) for a call from `sender`.
+    ///
+    /// Closing another sender's notification is a silent no-op, the same
+    /// answer an unknown id gets — which, from this sender's side, it is.
+    pub fn handle_close_from(&mut self, sender: Option<&str>, id: u32) -> Vec<DbusSignal> {
+        if !self.may_touch(sender, id) {
+            log::debug!("notif-core: close of {id} from a sender that does not own it");
+            return vec![];
+        }
         // Look in active first.
         if let Some(pos) = self.active.iter().position(|a| a.n.id == id) {
             let entry = self.active.remove(pos);
@@ -328,6 +370,38 @@ impl<C: Clock> Core<C> {
         }
         // Unknown id — succeed silently.
         vec![]
+    }
+
+    // ── Ownership ─────────────────────────────────────────────────────────────
+
+    /// Whether `sender` may replace or close `id`. A call with no sender
+    /// (IPC, tests) and an id with no recorded owner are not restricted.
+    fn may_touch(&self, sender: Option<&str>, id: u32) -> bool {
+        match (sender, self.owners.get(&id)) {
+            (Some(s), Some(owner)) => s == owner,
+            _ => true,
+        }
+    }
+
+    /// Record `sender` as the owner of the new notification `id`.
+    ///
+    /// Owners of ids no longer active or waiting are pruned here rather
+    /// than at each of the half-dozen places a notification can leave,
+    /// so the map stays as small as the two queues without every one of
+    /// those paths having to remember it.
+    fn record_owner(&mut self, id: u32, sender: Option<&str>) {
+        let (active, waiting) = (&self.active, &self.waiting);
+        self.owners.retain(|known, _| {
+            active.iter().any(|a| a.n.id == *known) || waiting.iter().any(|w| w.id == *known)
+        });
+        match sender {
+            Some(s) => {
+                self.owners.insert(id, s.to_owned());
+            }
+            None => {
+                self.owners.remove(&id);
+            }
+        }
     }
 
     // ── Handle UI Dismiss ─────────────────────────────────────────────────────
@@ -842,15 +916,17 @@ pub async fn run(initial_config: Arc<Config>, handles: CoreHandles) {
                     DbusCmd::Notify {
                         n,
                         replaces_id,
+                        sender,
                         reply,
                     } => {
-                        let (id, signals, ui_cmd) = core.handle_notify(n, replaces_id, now);
+                        let (id, signals, ui_cmd) =
+                            core.handle_notify_from(sender.as_deref(), n, replaces_id, now);
                         let _ = reply.send(id).await;
                         send_signals!(signals);
                         send_ui!(ui_cmd);
                     }
-                    DbusCmd::Close { id, reply } => {
-                        let signals = core.handle_close(id);
+                    DbusCmd::Close { id, sender, reply } => {
+                        let signals = core.handle_close_from(sender.as_deref(), id);
                         let _ = reply.send(()).await;
                         send_signals!(signals);
                         let sync = core.sync_cmd();
@@ -1364,6 +1440,45 @@ mod tests {
         }
         assert_eq!(core.waiting.len(), MAX_WAITING);
         assert!(core.waiting.iter().any(|w| w.id == critical));
+    }
+
+    fn notify_from(core: &mut Core<MockClock>, sender: &str, summary: &str, replaces: u32) -> u32 {
+        let now = core.clock.now();
+        core.handle_notify_from(Some(sender), simple_new(summary), replaces, now)
+            .0
+    }
+
+    /// Ids are small sequential integers, so any client on the bus could
+    /// guess another app's and overwrite what it was showing.
+    #[test]
+    fn a_notification_cannot_be_replaced_by_another_sender() {
+        let mut core = make_core(default_config());
+        let id = notify_from(&mut core, ":1.10", "mine", 0);
+        let other = notify_from(&mut core, ":1.66", "not yours", id);
+        assert_ne!(
+            other, id,
+            "another sender's replace must be a new notification"
+        );
+        let kept = core.active.iter().find(|a| a.n.id == id).unwrap();
+        assert_eq!(kept.n.summary, "mine");
+
+        // The owner still can.
+        let same = notify_from(&mut core, ":1.10", "mine, updated", id);
+        assert_eq!(same, id);
+        let kept = core.active.iter().find(|a| a.n.id == id).unwrap();
+        assert_eq!(kept.n.summary, "mine, updated");
+    }
+
+    #[test]
+    fn a_notification_cannot_be_closed_by_another_sender() {
+        let mut core = make_core(default_config());
+        let id = notify_from(&mut core, ":1.10", "mine", 0);
+        assert!(core.handle_close_from(Some(":1.66"), id).is_empty());
+        assert!(core.active.iter().any(|a| a.n.id == id));
+
+        let signals = core.handle_close_from(Some(":1.10"), id);
+        assert_eq!(signals.len(), 1);
+        assert!(!core.active.iter().any(|a| a.n.id == id));
     }
 
     #[test]
@@ -2157,6 +2272,7 @@ mod tests {
                             raw_hints: Default::default(),
                         }),
                         replaces_id: 0,
+                        sender: None,
                         reply: reply_tx,
                     })
                     .await
@@ -2290,6 +2406,7 @@ mod tests {
                             raw_hints: Default::default(),
                         }),
                         replaces_id: 0,
+                        sender: None,
                         reply: id_tx,
                     })
                     .await
@@ -2305,6 +2422,7 @@ mod tests {
                 dbus_tx
                     .send(DbusCmd::Close {
                         id,
+                        sender: None,
                         reply: close_tx,
                     })
                     .await
@@ -2365,6 +2483,7 @@ mod tests {
                             raw_hints: Default::default(),
                         }),
                         replaces_id: 0,
+                        sender: None,
                         reply: id_tx,
                     })
                     .await
@@ -2426,6 +2545,7 @@ mod tests {
                             raw_hints: Default::default(),
                         }),
                         replaces_id: 0,
+                        sender: None,
                         reply: id_tx,
                     })
                     .await

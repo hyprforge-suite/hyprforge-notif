@@ -21,6 +21,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                     n,
                     replaces_id,
                     reply,
+                    ..
                 } => {
                     let id = if replaces_id != 0 {
                         replaces_id
@@ -47,7 +48,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("  actions: {:?}", n.actions);
                     let _ = reply.send(id).await;
                 }
-                DbusCmd::Close { id, reply } => {
+                DbusCmd::Close { id, reply, .. } => {
                     println!("CLOSE id={id}");
                     let _ = reply.send(()).await;
                     let _ = signal_tx
