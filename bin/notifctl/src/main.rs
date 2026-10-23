@@ -163,8 +163,29 @@ fn connect() -> Result<UnixStream> {
     let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
         .ok_or_else(|| anyhow::anyhow!("$XDG_RUNTIME_DIR is not set; is notifd running?"))?;
     let path = std::path::PathBuf::from(runtime_dir).join("notif.sock");
-    UnixStream::connect(&path)
-        .with_context(|| format!("cannot connect to {path:?}; is notifd running?"))
+    let stream = UnixStream::connect(&path)
+        .with_context(|| format!("cannot connect to {path:?}; is notifd running?"))?;
+    apply_timeouts(&stream, IO_TIMEOUT)?;
+    Ok(stream)
+}
+
+/// How long notifctl waits on the daemon before giving up.
+const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bound every read and write on `stream` by `limit`.
+///
+/// A blocking socket waits forever by default, so a daemon that accepted
+/// the connection and then stopped answering left notifctl — and the
+/// keybind or bar that ran it — hung. A timeout surfaces as an I/O error
+/// from `send_recv`, which already reports one.
+fn apply_timeouts(stream: &UnixStream, limit: std::time::Duration) -> Result<()> {
+    stream
+        .set_read_timeout(Some(limit))
+        .context("set a read timeout on the IPC socket")?;
+    stream
+        .set_write_timeout(Some(limit))
+        .context("set a write timeout on the IPC socket")?;
+    Ok(())
 }
 
 /// Send one JSON request line and return the trimmed response line.
@@ -337,6 +358,24 @@ fn main() {
 mod tests {
     use super::*;
     use notif_ipc::protocol::ErrResponse;
+
+    /// A daemon that accepts and never answers — wedged, or stopped
+    /// under a debugger — left notifctl (and whatever keybind ran it)
+    /// waiting forever. A blocked `read_line` fails the test by deadline
+    /// rather than hanging it.
+    #[test]
+    fn a_daemon_that_never_answers_is_an_error_not_a_hang() {
+        let (ours, _daemon) = UnixStream::pair().unwrap();
+        apply_timeouts(&ours, std::time::Duration::from_millis(100)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(send_recv(&ours, r#"{"cmd":"status"}"#).is_err());
+        });
+        let errored = rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("send_recv blocked on a silent daemon");
+        assert!(errored);
+    }
 
     // ── relative_age (delegates to notif_types::relative_age) ────────────────
 

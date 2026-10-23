@@ -15,7 +15,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
+# One task per connection, on an executor owned by the accept loop.
+async-executor = "1"
 
 [dev-dependencies]
-async-executor = "1"
 tempfile = { workspace = true }

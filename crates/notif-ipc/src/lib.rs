@@ -25,8 +25,9 @@
 //! before binding.  The socket is removed again on clean exit.
 
 use std::path::Path;
+use std::time::Duration;
 
-use futures_lite::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use futures_lite::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use notif_types::{HistoryEntry, IpcCmd, StatusInfo};
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -165,6 +166,24 @@ pub async fn run(ipc_tx: async_channel::Sender<IpcCmd>) -> Result<(), IpcError> 
 /// this future mid-await — cleanup therefore lives in a `Drop` guard, not in
 /// straight-line code after the accept loop.
 pub async fn run_at(path: &Path, ipc_tx: async_channel::Sender<IpcCmd>) -> Result<(), IpcError> {
+    serve(path, ipc_tx, IDLE_TIMEOUT).await
+}
+
+/// How long a connection may sit without sending a whole request, or
+/// without taking a response, before it is closed. `notifctl` sends its
+/// one line the moment it connects; anything quiet for this long is not
+/// going to say anything.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The longest request line accepted. The longest real one is a `close`
+/// with a ten-digit id, well under a hundred bytes.
+const MAX_REQUEST_BYTES: usize = 4096;
+
+async fn serve(
+    path: &Path,
+    ipc_tx: async_channel::Sender<IpcCmd>,
+    idle: Duration,
+) -> Result<(), IpcError> {
     /// Unlinks the socket file when dropped (normal return AND task cancellation).
     struct SocketGuard(std::path::PathBuf);
     impl Drop for SocketGuard {
@@ -183,27 +202,61 @@ pub async fn run_at(path: &Path, ipc_tx: async_channel::Sender<IpcCmd>) -> Resul
 
     log::info!("notif-ipc: listening at {path:?}");
 
-    loop {
-        match listener.accept().await {
-            Ok((stream, _addr)) => {
-                let alive = handle_connection(stream, &ipc_tx).await;
-                if !alive {
+    // Each connection runs as a task of its own. The loop used to await
+    // one connection to the end before accepting the next, so a client
+    // that connected and said nothing held every other client off until
+    // it left. The executor is local to this future: dropping the future
+    // (which is how notifd shuts the IPC task down) drops every
+    // connection with it. A connection that finds the core gone says so
+    // on `core_closed`, which ends the accept loop.
+    let ex = async_executor::LocalExecutor::new();
+    let (core_closed_tx, core_closed_rx) = async_channel::bounded::<()>(1);
+    ex.run(async {
+        loop {
+            let accepted =
+                futures_lite::future::or(async { Some(listener.accept().await) }, async {
+                    let _ = core_closed_rx.recv().await;
+                    None
+                })
+                .await;
+            match accepted {
+                None => {
                     log::info!("notif-ipc: core channel closed; exiting");
                     break;
                 }
-            }
-            Err(e) => {
-                log::error!("notif-ipc: accept error: {e}");
-                if ipc_tx.is_closed() {
-                    log::info!("notif-ipc: core channel closed after accept error; exiting");
-                    break;
+                Some(Ok((stream, _addr))) => {
+                    let ipc_tx = ipc_tx.clone();
+                    let core_closed_tx = core_closed_tx.clone();
+                    ex.spawn(async move {
+                        if !handle_connection(stream, &ipc_tx, idle).await {
+                            let _ = core_closed_tx.try_send(());
+                        }
+                    })
+                    .detach();
+                }
+                Some(Err(e)) => {
+                    log::error!("notif-ipc: accept error: {e}");
+                    if ipc_tx.is_closed() {
+                        log::info!("notif-ipc: core channel closed after accept error; exiting");
+                        break;
+                    }
                 }
             }
         }
-    }
+    })
+    .await;
 
     // Socket file removal happens in SocketGuard::drop.
     Err(IpcError::CoreClosed)
+}
+
+/// `fut`, or `None` if it has not finished within `limit`.
+async fn within<T>(limit: Duration, fut: impl std::future::Future<Output = T>) -> Option<T> {
+    futures_lite::future::or(async { Some(fut.await) }, async {
+        async_io::Timer::after(limit).await;
+        None
+    })
+    .await
 }
 
 // ── Per-connection handler ────────────────────────────────────────────────────
@@ -213,25 +266,48 @@ pub async fn run_at(path: &Path, ipc_tx: async_channel::Sender<IpcCmd>) -> Resul
 /// Reads JSON request lines until the client closes the connection, and writes
 /// one JSON response line per request.  Returns `false` if the core channel is
 /// closed (the accept loop should stop); returns `true` to continue accepting.
+///
+/// A connection is closed when it sends nothing for `idle`, when a response
+/// cannot be written within `idle`, and when a request line runs past
+/// [`MAX_REQUEST_BYTES`] — `read_line` alone would buffer whatever arrived
+/// before a newline, however much that was.
 async fn handle_connection(
     stream: async_io::Async<std::os::unix::net::UnixStream>,
     ipc_tx: &async_channel::Sender<IpcCmd>,
+    idle: Duration,
 ) -> bool {
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
 
     loop {
         line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => {
+        // One byte past the cap, so a line of exactly the cap is told apart
+        // from one that was cut off.
+        let mut limited = (&mut reader).take(MAX_REQUEST_BYTES as u64 + 1);
+        let n = match within(idle, limited.read_line(&mut line)).await {
+            None => {
+                log::debug!("notif-ipc: connection idle past {idle:?}; closing");
+                return true;
+            }
+            Some(Ok(0)) => {
                 // Client closed connection.
                 return true;
             }
-            Ok(_) => {}
-            Err(e) => {
+            Some(Ok(n)) => n,
+            Some(Err(e)) => {
                 log::debug!("notif-ipc: read error on connection: {e}");
                 return true;
             }
+        };
+        if n > MAX_REQUEST_BYTES {
+            log::debug!("notif-ipc: request past {MAX_REQUEST_BYTES} bytes; closing");
+            if let Ok(s) = serde_json::to_string(&ErrResponse {
+                ok: false,
+                error: format!("request longer than {MAX_REQUEST_BYTES} bytes"),
+            }) {
+                let _ = within(idle, write_line(&stream, &s)).await;
+            }
+            return true;
         }
 
         let trimmed = line.trim();
@@ -265,7 +341,7 @@ async fn handle_connection(
                             ok: false,
                             error: "daemon shutting down".into(),
                         }) {
-                            let _ = write_line(&stream, &s).await;
+                            let _ = within(idle, write_line(&stream, &s)).await;
                         }
                         return false;
                     }
@@ -273,9 +349,10 @@ async fn handle_connection(
             }
         };
 
-        if write_line(&stream, &response_json).await.is_err() {
-            // Client disappeared mid-write.
-            return true;
+        match within(idle, write_line(&stream, &response_json)).await {
+            Some(Ok(())) => {}
+            // Client disappeared mid-write, or stopped reading.
+            Some(Err(_)) | None => return true,
         }
     }
 }
@@ -598,6 +675,93 @@ mod tests {
                 }
             })
             .await;
+        });
+    }
+
+    /// Runs `body` against a server at a fresh socket path, with the fake
+    /// core answering, and fails rather than hangs if it takes past `secs`.
+    fn with_server<F, Fut>(idle: Duration, secs: u64, body: F)
+    where
+        F: FnOnce(std::path::PathBuf) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        async_io::block_on(async {
+            let ex = async_executor::LocalExecutor::new();
+            let (ipc_tx, ipc_rx) = async_channel::unbounded::<IpcCmd>();
+            let tmpdir = tempfile::TempDir::new().expect("tmpdir");
+            let path = tmpdir.path().join("notif-test.sock");
+            ex.run(async {
+                ex.spawn(fake_core(ipc_rx)).detach();
+                let server_path = path.clone();
+                ex.spawn(async move {
+                    let _ = serve(&server_path, ipc_tx, idle).await;
+                })
+                .detach();
+                async_io::Timer::after(Duration::from_millis(50)).await;
+                let finished = futures_lite::future::or(
+                    async {
+                        body(path.clone()).await;
+                        true
+                    },
+                    async {
+                        async_io::Timer::after(Duration::from_secs(secs)).await;
+                        false
+                    },
+                )
+                .await;
+                assert!(finished, "the test did not finish within {secs}s");
+            })
+            .await;
+        });
+    }
+
+    /// The accept loop awaited each connection to the end before taking
+    /// the next, so one client that connected and said nothing wedged
+    /// every other — notifctl, the tray, a keybind — until it left.
+    #[test]
+    fn a_silent_client_does_not_hold_up_the_next_one() {
+        with_server(Duration::from_secs(60), 5, |path| async move {
+            let _silent = async_io::Async::<std::os::unix::net::UnixStream>::connect(&path)
+                .await
+                .expect("connect the silent client");
+            let resp = do_cmd(&path, r#"{"cmd":"dismiss-all"}"#).await;
+            assert_eq!(resp, r#"{"ok":true}"#);
+        });
+    }
+
+    #[test]
+    fn an_idle_connection_is_closed_after_the_timeout() {
+        with_server(Duration::from_millis(200), 5, |path| async move {
+            let stream = async_io::Async::<std::os::unix::net::UnixStream>::connect(&path)
+                .await
+                .expect("connect");
+            let mut buf = Vec::new();
+            // EOF from the server is the close.
+            let n = futures_lite::io::AsyncReadExt::read_to_end(&mut &stream, &mut buf)
+                .await
+                .expect("read until the server closes");
+            assert_eq!(n, 0);
+        });
+    }
+
+    /// `read_line` with no cap buffers whatever arrives before a newline.
+    #[test]
+    fn a_request_line_past_the_cap_is_refused_and_the_connection_closed() {
+        with_server(Duration::from_secs(60), 5, |path| async move {
+            let stream = async_io::Async::<std::os::unix::net::UnixStream>::connect(&path)
+                .await
+                .expect("connect");
+            let long = vec![b'x'; MAX_REQUEST_BYTES + 10];
+            // The server may close before taking all of it; that is fine.
+            let _ = (&stream).write_all(&long).await;
+            let mut reader = BufReader::new(&stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read response");
+            let v: serde_json::Value = serde_json::from_str(line.trim()).expect("JSON");
+            assert_eq!(v["ok"], false);
+            line.clear();
+            let n = reader.read_line(&mut line).await.unwrap_or(0);
+            assert_eq!(n, 0, "the connection should be closed");
         });
     }
 }
