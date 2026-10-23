@@ -47,12 +47,12 @@ pub fn parse_hints(
         if let Some(v) = hints.get("image-path")
             && let Some(s) = parse_string_hint(v)
         {
-            break 'image Some(ImageSource::Path(s));
+            break 'image Some(image_path_source(s));
         }
         if let Some(v) = hints.get("image_path")
             && let Some(s) = parse_string_hint(v)
         {
-            break 'image Some(ImageSource::Path(s));
+            break 'image Some(image_path_source(s));
         }
         // A non-empty app_icon parameter takes precedence over the legacy
         // icon_data hint, but it is not an image hint itself: it stays in the
@@ -122,6 +122,23 @@ pub fn parse_hints(
         category,
         desktop_entry,
         raw_hints,
+    }
+}
+
+/// What an `image-path` hint names.
+///
+/// The spec allows a `file://` URI or an icon-theme name as well as a
+/// plain path. Only a path is ever opened; the URI is stripped to one,
+/// the same way the renderer already treats a `file://` `app_icon`, and
+/// anything not absolute is looked up as an icon name rather than opened
+/// relative to wherever the daemon happens to be running.
+fn image_path_source(s: String) -> ImageSource {
+    if let Some(path) = s.strip_prefix("file://") {
+        ImageSource::Path(path.to_owned())
+    } else if s.starts_with('/') {
+        ImageSource::Path(s)
+    } else {
+        ImageSource::Icon(s)
     }
 }
 
@@ -468,6 +485,44 @@ mod tests {
     fn an_image_hint_with_a_negative_width_is_refused() {
         let owned = make_image_owned(-4, 2, 12, false, 8, 3, vec![0u8; 24]);
         assert!(parse_raw_image(&owned).is_none());
+    }
+
+    fn image_from_path_hint(value: &str) -> Option<ImageSource> {
+        let mut hints = HashMap::new();
+        hints.insert(
+            "image-path".to_string(),
+            OwnedValue::try_from(Value::Str(value.into())).unwrap(),
+        );
+        parse_hints(
+            "app".into(),
+            "".into(),
+            "s".into(),
+            "b".into(),
+            vec![],
+            hints,
+            -1,
+        )
+        .image
+    }
+
+    /// The spec lets `image-path` be a `file://` URI or an icon name as
+    /// well as a path. Passed through whole, `file:///x.png` was opened as
+    /// a relative path beginning `file:` and an icon name as a file in
+    /// the daemon's working directory.
+    #[test]
+    fn an_image_path_hint_is_a_file_uri_a_path_or_an_icon_name() {
+        assert!(matches!(
+            image_from_path_hint("file:///tmp/art.png"),
+            Some(ImageSource::Path(p)) if p == "/tmp/art.png"
+        ));
+        assert!(matches!(
+            image_from_path_hint("/tmp/art.png"),
+            Some(ImageSource::Path(p)) if p == "/tmp/art.png"
+        ));
+        assert!(matches!(
+            image_from_path_hint("dialog-information"),
+            Some(ImageSource::Icon(n)) if n == "dialog-information"
+        ));
     }
 
     #[test]

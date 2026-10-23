@@ -223,6 +223,69 @@ fn premultiply_rgba(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
     [pre_r, pre_g, pre_b, a]
 }
 
+// ── Reading an image file a client named ───────────────────────────────────────
+
+/// The largest image file this renderer will read.
+///
+/// An `image-path` hint or a path-shaped `app_icon` is chosen by whoever
+/// sent the notification, and the daemon reads it on its one thread. 32MB
+/// is far more than any icon, album art or screenshot needs.
+const MAX_IMAGE_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The largest side and the most memory a raster decode may use.
+///
+/// A small file can still decompress into a huge canvas — a PNG that
+/// claims 60000x60000 is a few kilobytes. 10000 a side admits an 8K
+/// screenshot (which a screenshot tool's notification may well point
+/// at); 160MB is that screenshot as RGBA with a little to spare.
+const MAX_DECODE_SIDE: u32 = 10_000;
+const MAX_DECODE_ALLOC: u64 = 160 * 1024 * 1024;
+
+/// Read an image file a remote client named, or `None` if it is not one
+/// to read.
+///
+/// Only a regular file, and only up to [`MAX_IMAGE_FILE_BYTES`]. The type
+/// is checked on the *path* before opening, because opening is itself the
+/// hazard: `open(2)` on a FIFO blocks until a writer appears, and with
+/// nobody writing that froze every notification after it. Opening with
+/// `O_NONBLOCK` would close the gap entirely, but this crate has no `libc`
+/// to name the flag portably, so a client that swaps a regular file for a
+/// FIFO between the `stat` and the `open` can still win the race. That
+/// takes a racing writer on the user's own filesystem; the trivial attack
+/// — just name a FIFO — is what this stops. The read itself is bounded by
+/// `take`, so a file that grows after the `stat` cannot outrun the cap.
+fn read_image_file(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) => {
+            log::debug!("image {path:?}: {e}");
+            return None;
+        }
+    };
+    if !meta.is_file() {
+        log::warn!("image {path:?} is not a regular file; not reading it");
+        return None;
+    }
+    if meta.len() > MAX_IMAGE_FILE_BYTES {
+        log::warn!(
+            "image {path:?} is {} bytes, past the {MAX_IMAGE_FILE_BYTES}-byte cap; not reading it",
+            meta.len()
+        );
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_IMAGE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_IMAGE_FILE_BYTES {
+        log::warn!("image {path:?} grew past the size cap while being read");
+        return None;
+    }
+    Some(bytes)
+}
+
 // ── Icon cache key ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1435,8 +1498,27 @@ impl SkiaRenderer {
         Some(out)
     }
 
-    fn load_raster_image(path: &PathBuf, target_size: u32) -> Option<Pixmap> {
-        let img = image::open(path).ok()?;
+    fn load_raster_image(path: &std::path::Path, target_size: u32) -> Option<Pixmap> {
+        // Not `image::open`: it opens whatever the path is (a FIFO
+        // blocks) and decodes with no bound on the canvas a few bytes of
+        // header can claim. The format is sniffed from the bytes, as
+        // `open` effectively did for the formats this crate enables.
+        let bytes = read_image_file(path)?;
+        let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(MAX_DECODE_SIDE);
+        limits.max_image_height = Some(MAX_DECODE_SIDE);
+        limits.max_alloc = Some(MAX_DECODE_ALLOC);
+        reader.limits(limits);
+        let img = match reader.decode() {
+            Ok(img) => img,
+            Err(e) => {
+                log::warn!("image {path:?} not decoded: {e}");
+                return None;
+            }
+        };
         let img = img.resize(
             target_size,
             target_size,
@@ -1457,9 +1539,20 @@ impl SkiaRenderer {
     }
 
     #[cfg(feature = "svg")]
-    fn load_svg(path: &PathBuf, target_size: u32) -> Option<Pixmap> {
-        let data = std::fs::read(path).ok()?;
-        let opts = resvg::usvg::Options::default();
+    fn load_svg(path: &std::path::Path, target_size: u32) -> Option<Pixmap> {
+        let data = read_image_file(path)?;
+        // usvg's default `<image xlink:href>` resolver opens any path the
+        // SVG names, and the SVG is one a remote client chose — so it
+        // could make the daemon read (and draw) any file the user can,
+        // FIFOs included. Only images embedded as `data:` URLs are
+        // resolved; a string href resolves to nothing.
+        let opts = resvg::usvg::Options {
+            image_href_resolver: resvg::usvg::ImageHrefResolver {
+                resolve_data: resvg::usvg::ImageHrefResolver::default_data_resolver(),
+                resolve_string: Box::new(|_, _| None),
+            },
+            ..resvg::usvg::Options::default()
+        };
         let tree = resvg::usvg::Tree::from_data(&data, &opts).ok()?;
         let mut pixmap = Pixmap::new(target_size, target_size)?;
         let size = tree.size();
@@ -1471,7 +1564,7 @@ impl SkiaRenderer {
         Some(pixmap)
     }
 
-    fn load_image_from_path(path: &PathBuf, target_size: u32) -> Option<Pixmap> {
+    fn load_image_from_path(path: &std::path::Path, target_size: u32) -> Option<Pixmap> {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -2879,6 +2972,110 @@ mod tests {
         assert!(
             has_history_close,
             "history entry must hit-test to HistoryClose"
+        );
+    }
+
+    // ── Image files named by a remote client ───────────────────────────────
+
+    /// A scratch directory unique to one test, removed when dropped.
+    /// Hand-rolled rather than `tempfile`, which this crate does not
+    /// depend on.
+    struct ScratchDir(PathBuf);
+    impl ScratchDir {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("notif-render-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Loads `path` on a thread of its own and gives up after `secs`, so
+    /// a load that blocks forever fails the test instead of hanging it.
+    fn load_with_deadline(path: PathBuf, secs: u64) -> Result<Option<Pixmap>, ()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(SkiaRenderer::load_image_from_path(&path, 32));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(secs))
+            .map_err(|_| ())
+    }
+
+    /// An image path comes from whoever sent the notification, and the
+    /// daemon has one thread. Opening a FIFO blocks until someone writes
+    /// to it, which nobody will: every notification after it froze.
+    #[test]
+    fn an_image_path_that_is_a_fifo_is_refused_without_blocking() {
+        let dir = ScratchDir::new("fifo");
+        let fifo = dir.0.join("art.png");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo failed");
+        let loaded = load_with_deadline(fifo, 3).expect("loading a FIFO blocked");
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn an_image_file_past_the_size_cap_is_not_read() {
+        let dir = ScratchDir::new("big");
+        let big = dir.0.join("big.png");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(MAX_IMAGE_FILE_BYTES + 1).unwrap();
+        assert!(read_image_file(&big).is_none());
+        // And one under it is read, so the cap is what refused it.
+        let small = dir.0.join("small.png");
+        std::fs::write(&small, b"not really a png").unwrap();
+        assert!(read_image_file(&small).is_some());
+    }
+
+    /// A few kilobytes of PNG can claim a canvas of gigabytes; the decode
+    /// limits are what refuse it, and a strip one pixel tall is the cheap
+    /// way to prove they are set.
+    #[test]
+    fn an_image_wider_than_the_decode_limit_is_refused() {
+        let dir = ScratchDir::new("wide");
+        let wide = dir.0.join("wide.png");
+        image::RgbaImage::new(MAX_DECODE_SIDE + 1, 1)
+            .save(&wide)
+            .unwrap();
+        assert!(SkiaRenderer::load_image_from_path(&wide, 32).is_none());
+        let ok = dir.0.join("ok.png");
+        image::RgbaImage::new(MAX_DECODE_SIDE, 1).save(&ok).unwrap();
+        assert!(SkiaRenderer::load_image_from_path(&ok, 32).is_some());
+    }
+
+    /// usvg's default resolver opens any path an `<image>` names, so an
+    /// SVG a client points at could make the daemon read further files —
+    /// and draw them.
+    #[cfg(feature = "svg")]
+    #[test]
+    fn an_svg_cannot_pull_in_another_file_through_an_image_href() {
+        let dir = ScratchDir::new("svg");
+        let red = dir.0.join("red.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255]))
+            .save(&red)
+            .unwrap();
+        let svg = dir.0.join("icon.svg");
+        std::fs::write(
+            &svg,
+            format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="8" height="8"><image width="8" height="8" xlink:href="{}"/></svg>"#,
+                red.display()
+            ),
+        )
+        .unwrap();
+        let px = SkiaRenderer::load_image_from_path(&svg, 8).unwrap();
+        assert!(
+            px.data().chunks_exact(4).all(|p| p[3] == 0),
+            "the referenced file was drawn"
         );
     }
 }
