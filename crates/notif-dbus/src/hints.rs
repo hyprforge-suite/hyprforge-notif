@@ -17,6 +17,30 @@ const KNOWN_KEYS: &[&str] = &[
     "desktop-entry",
 ];
 
+/// Caps on the text a client sends. Each notification is kept on screen,
+/// in the waiting queue and in history, so without them the size of all
+/// three was whatever a client on the session bus chose to send. Each is
+/// generous for what the field is for: a toast shows a few lines.
+const MAX_APP_NAME_BYTES: usize = 256;
+const MAX_SUMMARY_BYTES: usize = 1024;
+const MAX_BODY_BYTES: usize = 16 * 1024;
+/// Action buttons beyond this many could not be drawn anyway.
+const MAX_ACTIONS: usize = 16;
+const MAX_ACTION_FIELD_BYTES: usize = 256;
+
+/// Cut `s` to at most `max` bytes, on a character boundary.
+fn truncate_to(mut s: String, max: usize, what: &str) -> String {
+    if s.len() > max {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        log::warn!("notif-dbus: {what} of {} bytes cut to {end}", s.len());
+        s.truncate(end);
+    }
+    s
+}
+
 pub fn parse_hints(
     app_name: String,
     app_icon: String,
@@ -26,6 +50,10 @@ pub fn parse_hints(
     hints: HashMap<String, OwnedValue>,
     expire_timeout: i32,
 ) -> NewNotification {
+    let app_name = truncate_to(app_name, MAX_APP_NAME_BYTES, "app_name");
+    let summary = truncate_to(summary, MAX_SUMMARY_BYTES, "summary");
+    let body = truncate_to(body, MAX_BODY_BYTES, "body");
+
     // Parse urgency
     let urgency = hints
         .get("urgency")
@@ -97,7 +125,21 @@ pub fn parse_hints(
                     log::warn!("notif-dbus: trailing unpaired action key {:?} dropped", key);
                     break;
                 }
-                Some(label) => actions.push(Action { key, label }),
+                Some(label) => {
+                    if actions.len() == MAX_ACTIONS {
+                        log::warn!("notif-dbus: more than {MAX_ACTIONS} actions; the rest dropped");
+                        break;
+                    }
+                    // A key is echoed back verbatim in ActionInvoked, so one
+                    // too long is dropped rather than cut into a key the
+                    // sender never registered; a label is only drawn.
+                    if key.len() > MAX_ACTION_FIELD_BYTES {
+                        log::warn!("notif-dbus: action key of {} bytes dropped", key.len());
+                        continue;
+                    }
+                    let label = truncate_to(label, MAX_ACTION_FIELD_BYTES, "action label");
+                    actions.push(Action { key, label });
+                }
             },
         }
     }
@@ -523,6 +565,49 @@ mod tests {
             image_from_path_hint("dialog-information"),
             Some(ImageSource::Icon(n)) if n == "dialog-information"
         ));
+    }
+
+    /// Every one of these is kept — on screen, in the queue and in
+    /// history — so a client sending megabytes of text was memory it
+    /// chose. Truncation lands on a character boundary.
+    #[test]
+    fn oversized_text_and_action_lists_are_cut_to_their_caps() {
+        let actions = (0..MAX_ACTIONS + 5)
+            .flat_map(|i| [format!("k{i}"), format!("label {i}")])
+            .collect();
+        let n = parse_hints(
+            "é".repeat(MAX_APP_NAME_BYTES),
+            "".into(),
+            "é".repeat(MAX_SUMMARY_BYTES),
+            "é".repeat(MAX_BODY_BYTES),
+            actions,
+            HashMap::new(),
+            -1,
+        );
+        assert!(n.app_name.len() <= MAX_APP_NAME_BYTES);
+        assert!(n.summary.len() <= MAX_SUMMARY_BYTES);
+        assert!(n.body.len() <= MAX_BODY_BYTES);
+        assert!(n.summary.chars().all(|c| c == 'é'));
+        assert!(n.summary.len() >= MAX_SUMMARY_BYTES - 1);
+        assert_eq!(n.actions.len(), MAX_ACTIONS);
+
+        let n = parse_hints(
+            "app".into(),
+            "".into(),
+            "s".into(),
+            "b".into(),
+            vec![
+                "k".repeat(MAX_ACTION_FIELD_BYTES + 1),
+                "dropped".into(),
+                "default".into(),
+                "l".repeat(MAX_ACTION_FIELD_BYTES + 1),
+            ],
+            HashMap::new(),
+            -1,
+        );
+        assert_eq!(n.actions.len(), 1);
+        assert_eq!(n.actions[0].key, "default");
+        assert_eq!(n.actions[0].label.len(), MAX_ACTION_FIELD_BYTES);
     }
 
     #[test]

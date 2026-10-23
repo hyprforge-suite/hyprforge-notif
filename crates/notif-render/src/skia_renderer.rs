@@ -288,10 +288,24 @@ fn read_image_file(path: &std::path::Path) -> Option<Vec<u8>> {
 
 // ── Icon cache key ─────────────────────────────────────────────────────────────
 
+/// How many icons the cache holds before it starts again.
+///
+/// Every path a notification names is an entry, and the paths are the
+/// sender's to choose, so an unbounded map was memory any client could
+/// grow. Clearing on overflow rather than evicting one at a time keeps
+/// this a `HashMap` with no new dependency; the working set — a handful of
+/// app icons — is back after one frame.
+const MAX_ICON_CACHE_ENTRIES: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum CacheKey {
-    /// Filesystem path + target size.
-    Path(String, u32),
+    /// Filesystem path + target size + what the file was when read.
+    ///
+    /// The stamp is the file's mtime and length (`None` when it could not
+    /// be stat'd). On the path alone, a player that rewrites one album-art
+    /// file per track had every track after the first drawn with the first
+    /// one's cover; with the stamp, a rewrite is a different key.
+    Path(String, u32, Option<(SystemTime, u64)>),
     /// Freedesktop icon name + target size.
     Name(String, u32),
 }
@@ -1613,12 +1627,15 @@ impl SkiaRenderer {
                 Self::raw_image_to_pixmap(raw).and_then(|p| Self::scale_pixmap(&p, icon_size))
             }
             ImageSource::Path(p) => {
-                let key = CacheKey::Path(p.clone(), icon_size);
+                let stamp = std::fs::metadata(p)
+                    .ok()
+                    .and_then(|m| Some((m.modified().ok()?, m.len())));
+                let key = CacheKey::Path(p.clone(), icon_size, stamp);
                 if let Some(cached) = self.icon_cache.get(&key) {
                     return cached.clone();
                 }
                 let result = Self::load_image_from_path(&PathBuf::from(p), icon_size);
-                self.icon_cache.insert(key, result.clone());
+                self.cache_icon(key, result.clone());
                 result
             }
             ImageSource::Icon(name) => {
@@ -1628,10 +1645,19 @@ impl SkiaRenderer {
                 }
                 let result = Self::resolve_icon(name, icon_size, icon_theme)
                     .and_then(|path| Self::load_image_from_path(&path, icon_size));
-                self.icon_cache.insert(key, result.clone());
+                self.cache_icon(key, result.clone());
                 result
             }
         }
+    }
+
+    /// Insert into the icon cache, starting it again once it is full
+    /// (see [`MAX_ICON_CACHE_ENTRIES`]).
+    fn cache_icon(&mut self, key: CacheKey, icon: Option<Pixmap>) {
+        if self.icon_cache.len() >= MAX_ICON_CACHE_ENTRIES {
+            self.icon_cache.clear();
+        }
+        self.icon_cache.insert(key, icon);
     }
 
     /// Build a rounded-rect path.
@@ -3050,6 +3076,44 @@ mod tests {
         let ok = dir.0.join("ok.png");
         image::RgbaImage::new(MAX_DECODE_SIDE, 1).save(&ok).unwrap();
         assert!(SkiaRenderer::load_image_from_path(&ok, 32).is_some());
+    }
+
+    fn solid_png(path: &std::path::Path, side: u32, rgba: [u8; 4]) {
+        image::RgbaImage::from_pixel(side, side, image::Rgba(rgba))
+            .save(path)
+            .unwrap();
+    }
+
+    /// Players rewrite one album-art file per track. Cached on the path
+    /// alone, every track after the first showed the first one's cover.
+    #[test]
+    fn a_rewritten_image_file_is_loaded_again_rather_than_served_from_cache() {
+        let dir = ScratchDir::new("rewrite");
+        let art = dir.0.join("cover.png");
+        let mut renderer = SkiaRenderer::new();
+        let source = ImageSource::Path(art.to_string_lossy().into_owned());
+
+        solid_png(&art, 8, [255, 0, 0, 255]);
+        let first = renderer.load_icon_cached(&source, 8, None).unwrap();
+        assert_eq!(&first.data()[0..4], &[255, 0, 0, 255]);
+
+        // A different size as well as colour, so the file's length changes
+        // even where the filesystem's mtime is too coarse to.
+        solid_png(&art, 16, [0, 0, 255, 255]);
+        let second = renderer.load_icon_cached(&source, 8, None).unwrap();
+        assert_eq!(&second.data()[0..4], &[0, 0, 255, 255]);
+    }
+
+    /// Every path a client names is a cache entry, so the cache needs a
+    /// bound of its own.
+    #[test]
+    fn the_icon_cache_does_not_grow_past_its_cap() {
+        let mut renderer = SkiaRenderer::new();
+        for i in 0..MAX_ICON_CACHE_ENTRIES * 3 {
+            let source = ImageSource::Path(format!("/nonexistent/notif-test/{i}.png"));
+            let _ = renderer.load_icon_cached(&source, 8, None);
+        }
+        assert!(renderer.icon_cache.len() <= MAX_ICON_CACHE_ENTRIES);
     }
 
     /// usvg's default resolver opens any path an `<image>` names, so an

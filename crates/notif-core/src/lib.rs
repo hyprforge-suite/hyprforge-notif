@@ -16,6 +16,14 @@ use notif_types::{
     IpcCmd, NewNotification, Notification, StatusInfo, Timeout, UiCommand, UiEvent, Urgency,
 };
 
+/// How many notifications may wait for a slot behind the visible ones.
+///
+/// Notify is open to every client on the session bus, and a queue with no
+/// bound is memory any one of them can take. 256 is far past what anyone
+/// reads before dismissing; past it the oldest ordinary entry is dropped
+/// (see [`Core::handle_notify`]).
+pub const MAX_WAITING: usize = 256;
+
 // ── Clock abstraction (for testing) ──────────────────────────────────────────
 
 /// Abstraction over the system clock so tests can inject a fake.
@@ -238,9 +246,40 @@ impl<C: Clock> Core<C> {
             self.center_dirty = true;
         } else {
             self.waiting.push_back(notification);
+            if let Some(signal) = self.shed_waiting() {
+                return (id, vec![signal], self.sync_cmd());
+            }
         }
 
         (id, vec![], self.sync_cmd())
+    }
+
+    /// Keep the waiting queue within [`MAX_WAITING`] by dropping its oldest
+    /// non-critical entry (or, if every one is critical, its oldest).
+    ///
+    /// The dropped notification goes to history like any other that closed
+    /// unseen, and its sender is told with reason 4, "undefined/reserved":
+    /// it did not expire (1), the user did not dismiss it (2) and nobody
+    /// called CloseNotification (3), so each of those would be a claim
+    /// about something that did not happen. A sender that tracks its ids
+    /// must still hear the id is gone, or it waits on it forever.
+    fn shed_waiting(&mut self) -> Option<DbusSignal> {
+        if self.waiting.len() <= MAX_WAITING {
+            return None;
+        }
+        let pos = self
+            .waiting
+            .iter()
+            .position(|w| w.urgency != Urgency::Critical)
+            .unwrap_or(0);
+        let dropped = self.waiting.remove(pos)?;
+        let id = dropped.id;
+        log::warn!("notif-core: waiting queue full; dropped notification {id}");
+        self.add_to_history(Arc::new(dropped));
+        Some(DbusSignal::NotificationClosed {
+            id,
+            reason: CloseReason::Undefined,
+        })
     }
 
     // ── Handle D-Bus Close ────────────────────────────────────────────────────
@@ -1267,6 +1306,64 @@ mod tests {
         // id2 still active, n3 promoted.
         assert!(core.active.iter().any(|a| a.n.id == id2));
         let _ = now; // suppress warning
+    }
+
+    /// Any session-bus client can call Notify in a loop, and everything
+    /// past `max_visible` used to queue without limit. Past the cap the
+    /// oldest waiting entry goes, and its sender hears that it closed.
+    #[test]
+    fn the_waiting_queue_is_bounded_and_says_what_it_dropped() {
+        let config = Arc::new(Config {
+            max_visible: 1,
+            ..Config::default()
+        });
+        let mut core = make_core(config);
+        let now = core.clock.now();
+        let _shown = notify(&mut core, "shown");
+        let first_waiting = notify(&mut core, "first waiting");
+        for i in 1..MAX_WAITING {
+            notify(&mut core, &format!("waiting {i}"));
+        }
+        assert_eq!(core.waiting.len(), MAX_WAITING);
+
+        let (_, signals, _) = core.handle_notify(simple_new("one more"), 0, now);
+        assert_eq!(core.waiting.len(), MAX_WAITING);
+        assert!(!core.waiting.iter().any(|w| w.id == first_waiting));
+        assert!(matches!(
+            signals.as_slice(),
+            [DbusSignal::NotificationClosed { id, reason: CloseReason::Undefined }]
+                if *id == first_waiting
+        ));
+    }
+
+    /// A flood of ordinary notifications must not push out a critical one
+    /// that is waiting its turn.
+    #[test]
+    fn a_full_queue_drops_an_ordinary_notification_before_a_critical_one() {
+        let config = Arc::new(Config {
+            max_visible: 1,
+            ..Config::default()
+        });
+        let mut core = make_core(config);
+        let now = core.clock.now();
+        let _shown = notify(&mut core, "shown");
+        let (critical, _, _) = core.handle_notify(
+            simple_new_with(
+                "urgent",
+                Urgency::Critical,
+                Timeout::Default,
+                false,
+                false,
+                None,
+            ),
+            0,
+            now,
+        );
+        for i in 0..MAX_WAITING + 10 {
+            notify(&mut core, &format!("flood {i}"));
+        }
+        assert_eq!(core.waiting.len(), MAX_WAITING);
+        assert!(core.waiting.iter().any(|w| w.id == critical));
     }
 
     #[test]
