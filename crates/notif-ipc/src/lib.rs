@@ -21,8 +21,9 @@
 //! connection.
 //!
 //! # Socket path
-//! `$XDG_RUNTIME_DIR/notif.sock`.  Any stale socket at that path is removed
-//! before binding.  The socket is removed again on clean exit.
+//! `$XDG_RUNTIME_DIR/notif.sock`.  A stale socket at that path — one nobody
+//! answers on — is removed before binding; a live one is left alone and the
+//! server refuses to start.  The socket is removed again on clean exit.
 
 use std::path::Path;
 use std::time::Duration;
@@ -44,6 +45,9 @@ pub enum IpcError {
     /// The core channel was closed (daemon shutting down).
     #[error("core IPC channel closed")]
     CoreClosed,
+    /// Another process is already answering on the socket path.
+    #[error("another process is already serving {0:?}")]
+    InUse(std::path::PathBuf),
 }
 
 // ── Public wire protocol types ────────────────────────────────────────────────
@@ -160,7 +164,8 @@ pub async fn run(ipc_tx: async_channel::Sender<IpcCmd>) -> Result<(), IpcError> 
 /// Intended for tests that supply a temporary path without relying on
 /// `$XDG_RUNTIME_DIR`.
 ///
-/// Any stale socket file at `path` is removed before binding.  The socket is
+/// A stale socket file at `path` is removed before binding; if something is
+/// answering on it, this returns [`IpcError::InUse`] instead.  The socket is
 /// removed again (best-effort) when this function returns **or is cancelled**:
 /// notifd shuts the IPC task down by dropping its executor task, which drops
 /// this future mid-await — cleanup therefore lives in a `Drop` guard, not in
@@ -192,8 +197,28 @@ async fn serve(
         }
     }
 
-    // Remove stale socket (best-effort — ignore errors).
-    let _ = std::fs::remove_file(path);
+    // A socket file is stale only if nobody answers on it. This used to
+    // unlink it unconditionally, so a second notifd — one that went on to
+    // lose the D-Bus name — took the first one's socket and then deleted
+    // it on exit, leaving the running daemon reachable by nobody. Probe
+    // first; refuse if something is listening. The connect is async and
+    // bounded, because a listener with a full backlog would hold a
+    // blocking one indefinitely — and an answer that slow still means
+    // someone is there.
+    let probe = within(
+        Duration::from_secs(1),
+        async_io::Async::<std::os::unix::net::UnixStream>::connect(path),
+    )
+    .await;
+    match probe {
+        Some(Ok(_)) | None => return Err(IpcError::InUse(path.to_path_buf())),
+        // Refused (a stale file a crash left), missing, or not a socket at
+        // all: nobody is being displaced. Remove it best-effort; a path we
+        // cannot clear makes `bind` fail and say why.
+        Some(Err(_)) => {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 
     // Bind and wrap in the async reactor.
     let listener = std::os::unix::net::UnixListener::bind(path).map_err(IpcError::Bind)?;
@@ -685,11 +710,28 @@ mod tests {
         F: FnOnce(std::path::PathBuf) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
+        let tmpdir = tempfile::TempDir::new().expect("tmpdir");
+        let path = tmpdir.path().join("notif-test.sock");
+        with_server_inner(&path, idle, secs, body);
+    }
+
+    fn with_server_at<F, Fut>(path: &Path, body: F)
+    where
+        F: FnOnce(std::path::PathBuf) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        with_server_inner(path, Duration::from_secs(60), 5, body);
+    }
+
+    fn with_server_inner<F, Fut>(path: &Path, idle: Duration, secs: u64, body: F)
+    where
+        F: FnOnce(std::path::PathBuf) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let path = path.to_path_buf();
         async_io::block_on(async {
             let ex = async_executor::LocalExecutor::new();
             let (ipc_tx, ipc_rx) = async_channel::unbounded::<IpcCmd>();
-            let tmpdir = tempfile::TempDir::new().expect("tmpdir");
-            let path = tmpdir.path().join("notif-test.sock");
             ex.run(async {
                 ex.spawn(fake_core(ipc_rx)).detach();
                 let server_path = path.clone();
@@ -762,6 +804,35 @@ mod tests {
             line.clear();
             let n = reader.read_line(&mut line).await.unwrap_or(0);
             assert_eq!(n, 0, "the connection should be closed");
+        });
+    }
+
+    /// A second notifd used to unlink the first one's socket and bind its
+    /// own — and then delete it on exit — leaving the running daemon
+    /// reachable by nobody. A live socket is now left alone.
+    #[test]
+    fn a_second_server_refuses_a_socket_someone_is_answering_on() {
+        with_server(Duration::from_secs(60), 5, |path| async move {
+            let (tx, _rx) = async_channel::unbounded::<IpcCmd>();
+            let second = serve(&path, tx, Duration::from_secs(60)).await;
+            assert!(matches!(second, Err(IpcError::InUse(_))));
+            // And the first is still the one answering.
+            let resp = do_cmd(&path, r#"{"cmd":"dismiss-all"}"#).await;
+            assert_eq!(resp, r#"{"ok":true}"#);
+        });
+    }
+
+    /// A socket file nobody is listening on is what a crash leaves
+    /// behind; that one is still cleared and taken over.
+    #[test]
+    fn a_stale_socket_with_no_listener_is_replaced() {
+        let tmpdir = tempfile::TempDir::new().expect("tmpdir");
+        let path = tmpdir.path().join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&path).expect("bind"));
+        assert!(path.exists(), "the stale socket file should be left");
+        with_server_at(&path, |path| async move {
+            let resp = do_cmd(&path, r#"{"cmd":"dismiss-all"}"#).await;
+            assert_eq!(resp, r#"{"ok":true}"#);
         });
     }
 }
