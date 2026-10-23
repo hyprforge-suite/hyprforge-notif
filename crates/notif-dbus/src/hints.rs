@@ -308,30 +308,7 @@ fn parse_raw_image(v: &OwnedValue) -> Option<RawImage> {
         return None;
     }
 
-    // Validate channels
-    if channels != 3 && channels != 4 {
-        log::warn!("notif-dbus: image channels={channels}, expected 3 or 4, ignoring");
-        return None;
-    }
-
-    // Validate data length: must be >= rowstride*(height-1) + width*channels
-    let min_len = if height > 0 {
-        let last_row_start = rowstride.saturating_mul(height.saturating_sub(1));
-        let last_row_len = width.saturating_mul(channels);
-        last_row_start.saturating_add(last_row_len)
-    } else {
-        0
-    };
-
-    if (data.len() as i32) < min_len {
-        log::warn!(
-            "notif-dbus: image data too small: {} bytes, need >= {min_len}, ignoring",
-            data.len()
-        );
-        return None;
-    }
-
-    Some(RawImage {
+    let image = RawImage {
         width,
         height,
         rowstride,
@@ -339,7 +316,32 @@ fn parse_raw_image(v: &OwnedValue) -> Option<RawImage> {
         bits_per_sample,
         channels,
         data,
-    })
+    };
+
+    // Geometry and length together. This used to check only
+    // `data.len() >= rowstride*(height-1) + width*channels`, in saturating
+    // i32 — which a rowstride of 0 satisfies with a single row of data for
+    // any height, and which never bounded the size at all. The renderer
+    // then allocated whatever width x height claimed. `required_len` is
+    // shared with the renderer so the two cannot disagree about what is
+    // acceptable.
+    let Some(min_len) = image.required_len() else {
+        log::warn!(
+            "notif-dbus: image geometry {width}x{height} stride {rowstride} channels {channels} \
+             refused (max side {}), ignoring",
+            RawImage::MAX_DIMENSION
+        );
+        return None;
+    };
+    if image.data.len() < min_len {
+        log::warn!(
+            "notif-dbus: image data too small: {} bytes, need >= {min_len}, ignoring",
+            image.data.len()
+        );
+        return None;
+    }
+
+    Some(image)
 }
 
 #[cfg(test)]
@@ -437,6 +439,35 @@ mod tests {
         let owned = make_image_owned(2, 2, 6, false, 8, 3, data);
         let result = parse_raw_image(&owned);
         assert!(result.is_none());
+    }
+
+    /// A rowstride of zero made the length check ask for one row of data
+    /// whatever the height claimed, so 180KB on the bus became a
+    /// 60000x60000 pixmap — 14.4GB — in the renderer.
+    #[test]
+    fn an_image_hint_claiming_a_huge_canvas_from_one_row_of_data_is_refused() {
+        let owned = make_image_owned(60_000, 60_000, 0, false, 8, 3, vec![0u8; 180_000]);
+        assert!(parse_raw_image(&owned).is_none());
+    }
+
+    #[test]
+    fn an_image_hint_whose_rows_overlap_is_refused() {
+        // 4px RGB rows need 12 bytes each; a stride of 1 overlaps them.
+        let owned = make_image_owned(4, 2, 1, false, 8, 3, vec![0u8; 13]);
+        assert!(parse_raw_image(&owned).is_none());
+    }
+
+    #[test]
+    fn an_image_hint_larger_than_the_cap_is_refused_even_with_all_its_data() {
+        let w = RawImage::MAX_DIMENSION + 1;
+        let owned = make_image_owned(w, 1, w * 3, false, 8, 3, vec![0u8; (w * 3) as usize]);
+        assert!(parse_raw_image(&owned).is_none());
+    }
+
+    #[test]
+    fn an_image_hint_with_a_negative_width_is_refused() {
+        let owned = make_image_owned(-4, 2, 12, false, 8, 3, vec![0u8; 24]);
+        assert!(parse_raw_image(&owned).is_none());
     }
 
     #[test]

@@ -1369,19 +1369,28 @@ impl SkiaRenderer {
     /// copying row by row so padded rowstrides are honoured.
     ///
     /// Public for testing (rowstride handling).
+    ///
+    /// Checks the geometry itself rather than trusting the D-Bus parser
+    /// to have done it, because this is public and a `RawImage` can be
+    /// built by anyone: `Pixmap::new` allocates `w * h * 4` bytes for
+    /// whatever it is given, and a failed allocation aborts the daemon.
     pub fn raw_image_to_pixmap(raw: &RawImage) -> Option<Pixmap> {
-        if raw.width <= 0 || raw.height <= 0 || raw.rowstride <= 0 || raw.channels < 3 {
+        let needed = raw.required_len()?;
+        if raw.data.len() < needed {
             return None;
         }
         let w = raw.width as u32;
         let h = raw.height as u32;
         let mut pixmap = Pixmap::new(w, h)?;
 
+        // In range by `required_len`: every value is positive and the
+        // whole image fits in `raw.data`, so none of this can overflow.
+        let stride = raw.rowstride as usize;
+        let channels = raw.channels as usize;
         let data = pixmap.data_mut();
         for row in 0..h {
             for col in 0..w {
-                let src_idx =
-                    (row as i32 * raw.rowstride) as usize + col as usize * raw.channels as usize;
+                let src_idx = row as usize * stride + col as usize * channels;
                 let r = raw.data.get(src_idx).copied().unwrap_or(0);
                 let g = raw.data.get(src_idx + 1).copied().unwrap_or(0);
                 let b = raw.data.get(src_idx + 2).copied().unwrap_or(0);

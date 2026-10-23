@@ -545,6 +545,41 @@ fn raw_image_padded_rowstride() {
     assert_eq!(&px[16..20], &[0x80, 0x80, 0x80, 255]);
 }
 
+/// `raw_image_to_pixmap` is public, so it cannot trust that whatever
+/// built the `RawImage` checked it: a width past the cap must not reach
+/// `Pixmap::new`, which would allocate whatever it was asked for.
+#[test]
+fn a_raw_image_wider_than_the_cap_is_refused_before_allocating() {
+    let width = RawImage::MAX_DIMENSION + 1;
+    let raw = RawImage {
+        width,
+        height: 1,
+        rowstride: width * 3,
+        has_alpha: false,
+        bits_per_sample: 8,
+        channels: 3,
+        data: vec![0; (width * 3) as usize],
+    };
+    assert!(SkiaRenderer::raw_image_to_pixmap(&raw).is_none());
+}
+
+/// A rowstride shorter than one row of pixels makes every row overlap
+/// the next, and is how a few bytes of data passed a length check meant
+/// for `height` full rows.
+#[test]
+fn a_raw_image_whose_rows_overlap_is_refused() {
+    let raw = RawImage {
+        width: 4,
+        height: 2,
+        rowstride: 1,
+        has_alpha: false,
+        bits_per_sample: 8,
+        channels: 3,
+        data: vec![0; 13],
+    };
+    assert!(SkiaRenderer::raw_image_to_pixmap(&raw).is_none());
+}
+
 #[test]
 fn raw_image_via_render_does_not_panic() {
     let raw = RawImage {

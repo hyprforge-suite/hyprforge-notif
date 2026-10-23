@@ -80,6 +80,49 @@ pub struct RawImage {
     pub data: Vec<u8>,
 }
 
+impl RawImage {
+    /// The largest width or height an image hint may claim.
+    ///
+    /// Any session-bus client can send one, and the renderer allocates
+    /// `width * height * 4` bytes for it before scaling it down to an
+    /// icon. Without a cap, a 60000x60000 claim was 14.4GB — and an
+    /// allocation failure aborts the process rather than returning an
+    /// error. 4096 is far past any icon or album art (it is scaled to
+    /// `icon_size` anyway) and bounds the worst case at 64MB.
+    pub const MAX_DIMENSION: i32 = 4096;
+
+    /// How many bytes of `data` an image with this geometry needs, or
+    /// `None` when the geometry itself is not one to accept.
+    ///
+    /// Pure arithmetic on the fields, shared so that the D-Bus parser
+    /// and the renderer (whose `raw_image_to_pixmap` is public, and so
+    /// cannot assume the parser ran) refuse exactly the same images.
+    /// Refused: a non-positive or over-[`MAX_DIMENSION`](Self::MAX_DIMENSION)
+    /// side, channels other than 3 or 4, and a rowstride shorter than one
+    /// row of pixels. That last one is what let a stride of `0` satisfy a
+    /// length check written as `rowstride * (height - 1) + row`: every row
+    /// "fit" in the first one, so the data said one row and the size said
+    /// sixty thousand.
+    pub fn required_len(&self) -> Option<usize> {
+        let in_range = |v: i32| (1..=Self::MAX_DIMENSION).contains(&v);
+        if !in_range(self.width) || !in_range(self.height) {
+            return None;
+        }
+        if self.channels != 3 && self.channels != 4 {
+            return None;
+        }
+        let width = usize::try_from(self.width).ok()?;
+        let height = usize::try_from(self.height).ok()?;
+        let channels = usize::try_from(self.channels).ok()?;
+        let rowstride = usize::try_from(self.rowstride).ok()?;
+        let row = width.checked_mul(channels)?;
+        if rowstride < row {
+            return None;
+        }
+        rowstride.checked_mul(height - 1)?.checked_add(row)
+    }
+}
+
 /// Image source attached to a notification.
 #[derive(Debug, Clone)]
 pub enum ImageSource {
